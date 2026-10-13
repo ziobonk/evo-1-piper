@@ -1,0 +1,14 @@
+max_action_dim: 24
+max_state_dim: 24
+max_views: 3
+normalization_type: bounds
+datasets_manifest: piper_eef_next_pose_v1.pkl
+data_groups:
+  piper_eef_absolute:
+    piper_sdk_raw_eef_next_pose:
+      path: /home/rhr/litevla/Evo-1/Evo_1/piper_data
+      view_map:
+        image_1: image
+        image_2: wrist_image
+      use_delta_action: false
+      process_suite: piper_eef_next_pose
