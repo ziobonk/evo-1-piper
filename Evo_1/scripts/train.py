@@ -326,6 +326,29 @@ def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=N
                 
         logging.info(f"[Rank {accelerator.process_index}] Saved checkpoint to {checkpoint_dir}")
 
+
+def prune_numeric_checkpoints(save_dir, keep_last, accelerator):
+    """Remove old complete numeric checkpoints after a newer save succeeds."""
+    if keep_last <= 0:
+        return
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        checkpoints = []
+        for entry in os.scandir(save_dir):
+            if not entry.is_dir(follow_symlinks=False) or not entry.name.startswith("step_"):
+                continue
+            step_text = entry.name[len("step_"):]
+            if step_text.isdigit() and os.path.isfile(os.path.join(entry.path, "checkpoint.json")):
+                checkpoints.append((int(step_text), entry.path))
+        checkpoints.sort()
+        for _, path in checkpoints[:-keep_last]:
+            try:
+                shutil.rmtree(path)
+                logging.info("Removed old numeric checkpoint %s", path)
+            except OSError as exc:
+                logging.warning("Could not remove old checkpoint %s: %s", path, exc)
+    accelerator.wait_for_everyone()
+
 def load_checkpoint_standard(model_engine, optimizer, load_dir, accelerator, tag="step_best", load_optimizer_states=True):
     checkpoint_path = os.path.join(load_dir, tag, "checkpoint.pt")
     if not os.path.exists(checkpoint_path):
@@ -734,7 +757,7 @@ def train(config: EvoConfig):
             if accelerator.distributed_type != DistributedType.NO:
                 torch.distributed.broadcast(is_best_tensor, src=0)
             
-            if is_best_tensor.item() == 1 and step > 1000:
+            if not config.disable_best_checkpoint and is_best_tensor.item() == 1 and step > 1000:
                 accelerator.print("start to save best checkpoint")
                 save_checkpoint(
                     save_dir,
@@ -755,13 +778,17 @@ def train(config: EvoConfig):
 
             # === Save periodic checkpoint ===
             if step % ckpt_interval == 0 and step > 0:
-                checkpoint_path = os.path.join(save_dir, f"checkpoint_step_{step}.pt")
                 save_checkpoint(save_dir, step=step, model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict)
+                prune_numeric_checkpoints(save_dir, config.keep_last_checkpoints, accelerator)
          
-    # === Save final model ===
-    save_checkpoint(save_dir, step="final", model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict)
-    logging.info(f"Final model saved to step_final/")
-    logging.info(f"Best checkpoint saved to step_best/ with loss {best_loss:.6f}")
+    # === Save final model unless the same step was just saved periodically ===
+    if step > 0 and step % ckpt_interval == 0:
+        logging.info("Final step %s is already saved to step_%s/; skipping duplicate step_final/", step, step)
+    else:
+        save_checkpoint(save_dir, step="final", model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict)
+        logging.info("Final model saved to step_final/")
+    if not config.disable_best_checkpoint:
+        logging.info(f"Best checkpoint saved to step_best/ with loss {best_loss:.6f}")
 
 
 if __name__ == "__main__":
@@ -802,6 +829,8 @@ if __name__ == "__main__":
     # Logging & checkpointing
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--ckpt_interval", type=int, default=10)
+    parser.add_argument("--disable_best_checkpoint", action="store_true", help="Skip frequently rewritten training-loss step_best checkpoints")
+    parser.add_argument("--keep_last_checkpoints", type=int, default=0, help="Keep only this many complete numeric checkpoints after a successful save; 0 keeps all")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
 
     # Resume
@@ -835,6 +864,8 @@ if __name__ == "__main__":
     parser.add_argument("--disable_cudnn_benchmark", action="store_true", help="Disable cuDNN benchmark (default is enabled)")
 
     args = parser.parse_args()
+    if args.keep_last_checkpoints < 0:
+        parser.error("--keep_last_checkpoints must be zero or positive")
     config_dict = vars(args)
     # Post-process inverse boolean flags for config
     config_dict["pin_memory"] = not config_dict.pop("disable_pin_memory", False)

@@ -58,7 +58,7 @@ accelerate launch --num_processes 1 --num_machines 1 \
   --ckpt_interval 1000 --log_interval 10
 ```
 
-先前作业在第 0 步后崩溃且还没有保存 checkpoint，因此第一阶段从头运行。第 10,000 步应生成 `piper_stage1/step_10000` 和 `step_final`。请先确认文件存在，再启动第二阶段：
+先前作业在第 0 步后崩溃且还没有保存 checkpoint，因此第一阶段从头运行。第 10,000 步应生成 `piper_stage1/step_10000`；新版训练脚本在周期 checkpoint 已保存最终步时不再重复写 `step_final`。请先确认文件存在，再启动第二阶段：
 
 ```bash
 ls /root/autodl-fs/evo/checkpoints/piper_stage1/step_10000/config.json
@@ -83,6 +83,33 @@ accelerate launch --num_processes 1 --num_machines 1 \
 训练中断后，选择**同阶段**最后一个完整的数值目录（例如 `step_2000`），在原命令中添加 `--resume --resume_path /.../step_2000`；第二阶段续训时删除 `--resume_pretrain`，并保持 `--max_steps 3000` 作为累计目标步数。不要把第二阶段的续训 checkpoint 指向第一阶段，也不要用 `step_final` 做常规续训。`step_best` 仅按单个训练 batch 的 loss 选出，不是验证集最优；优先比较固定间隔的 checkpoint 在独立演示和机器人上的表现。当前训练脚本没有验证集评估，不能仅凭训练 loss 判定可部署。
 
 缓存里记录了 `action_horizon`。两阶段保持 `--horizon 50` 和同一个 `--cache_dir`；若要试 10 帧窗口，请换一个缓存目录以重新导出数据。已导出的 50 帧缓存可以继续使用。
+
+### 磁盘写满后的续训
+
+DeepSpeed 写入中途失败的 `step_*` 目录可能不完整。先在 AutoDL 检查空间和 checkpoint 大小，不要从报错时正在写入的目录恢复。以第二阶段在 `step_11000` 写入失败为例，最近完整的数值目录通常是 `step_10500`，但须按实际文件确认：
+
+```bash
+CKPT=/root/autodl-fs/evo/checkpoints/piper_stage2
+df -h "$CKPT"
+df -i "$CKPT"
+du -sh "$CKPT"/step_* | sort -h
+ls -lh "$CKPT/step_10500"
+```
+
+可续训的单卡 DeepSpeed 目录至少应有非空的 `mp_rank_00_model_states.pt`、`*_optim_states.pt`、`checkpoint.json`、`config.json` 和 `norm_stats.json`。BF16 训练的优化器文件名可能以 `bf16_zero_pp_rank_0_` 开头。`checkpoint.json` 在模型和优化器保存成功后才写入。若 `step_11000` 缺少它，可删除这个不完整目录；先保留 `step_10500`，再把更早且确认不需要的 checkpoint 移到其他磁盘或逐个删除，至少腾出**一个完整 checkpoint 的大小**，还要留出日志和缓存余量。`step_best` 是单 batch 训练 loss 最低的一次，内部步数为字符串 `best`，不适合直接作为普通续训源；如需比较推理效果，可单独保留它。
+
+```bash
+test -s "$CKPT/step_10500/checkpoint.json" && \
+test -s "$CKPT/step_10500/config.json" && \
+test -s "$CKPT/step_10500/norm_stats.json" && \
+test -s "$CKPT/step_10500/mp_rank_00_model_states.pt" && \
+test -n "$(find "$CKPT/step_10500" -maxdepth 1 -type f -name '*_optim_states.pt' -size +0c -print -quit)"
+if test -d "$CKPT/step_11000" && ! test -f "$CKPT/step_11000/checkpoint.json"; then
+  rm -rf -- "$CKPT/step_11000"
+fi
+```
+
+然后沿用**原第二阶段命令**及原 `--max_steps` 总步数，只把第一阶段转第二阶段时的 `--resume_path` 改为完整的 `"$CKPT/step_10500"`，保留 `--resume`，并**删除 `--resume_pretrain`**；否则步数会被重置为 0。建议加 `--disable_best_checkpoint --keep_last_checkpoints 2`：前者停止频繁重写 `step_best`，后者在新数值 checkpoint 完整保存后，只保留最近两个完整数值目录，不会删 `step_best` 或当前未完成目录。若剩余步数不多，可适当增大 `--ckpt_interval`；新版脚本也会避免在最终步已保存周期 checkpoint 时重复写 `step_final`。下一次保存仍需足够空间。不要把 `--max_steps` 写成“剩余步数”，也不要删正在作为 `--resume_path` 的目录。
 
 ## 3. 推理服务
 

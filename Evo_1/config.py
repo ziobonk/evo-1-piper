@@ -42,6 +42,8 @@ class EvoConfig:
     non_finite_max_streak: int = 5
     log_interval: int = 10
     ckpt_interval: int = 10
+    disable_best_checkpoint: bool = False
+    keep_last_checkpoints: int = 0
     save_dir: str = "./checkpoints"
     enable_gradient_checkpointing: bool = True
     gradient_checkpointing_use_reentrant: bool = False
