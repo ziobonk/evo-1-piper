@@ -111,6 +111,8 @@ fi
 
 然后沿用**原第二阶段命令**及原 `--max_steps` 总步数，只把第一阶段转第二阶段时的 `--resume_path` 改为完整的 `"$CKPT/step_10500"`，保留 `--resume`，并**删除 `--resume_pretrain`**；否则步数会被重置为 0。建议加 `--disable_best_checkpoint --keep_last_checkpoints 2`：前者停止频繁重写 `step_best`，后者在新数值 checkpoint 完整保存后，只保留最近两个完整数值目录，不会删 `step_best` 或当前未完成目录。若剩余步数不多，可适当增大 `--ckpt_interval`；新版脚本也会避免在最终步已保存周期 checkpoint 时重复写 `step_final`。下一次保存仍需足够空间。不要把 `--max_steps` 写成“剩余步数”，也不要删正在作为 `--resume_path` 的目录。
 
+如果恢复后几乎每步都打印 `start to save best checkpoint`，当前进程仍启用了 `step_best` 保存。先中断它，确认一个完整的数值 checkpoint，再用上面的两个参数重启；只有修改本地文件而不重启 AutoDL 进程不会生效。旧 checkpoint 把最后一个 batch 的 loss 写入 `best_loss`，所以恢复初期容易反复刷新“best”；新版训练器已改为保存真实的累计最小值。`step_best` 仍只基于训练 batch，不能代替验证集选择模型。
+
 ## 3. 推理服务
 
 选择实际生成的 checkpoint 目录，其中须有 `config.json`、`norm_stats.json` 与 DeepSpeed 的 `mp_rank_00_model_states.pt` 或普通训练的 `checkpoint.pt`。

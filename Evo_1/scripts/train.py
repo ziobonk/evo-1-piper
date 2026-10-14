@@ -264,7 +264,7 @@ def log_training_step(step, loss, total_norm, momentum_norm, scheduler, dataload
             wandb.log(wandb_log_dict)
             swanlab.log(wandb_log_dict)
 
-def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=None, scheduler=None, config: EvoConfig=None, norm_stats=None):
+def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=None, scheduler=None, config: EvoConfig=None, norm_stats=None, best_loss=None):
     tag = f"step_{step}"
     checkpoint_dir = os.path.join(save_dir, tag)
     use_deepspeed = accelerator.distributed_type == DistributedType.DEEPSPEED
@@ -275,9 +275,10 @@ def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=N
 
     accelerator.wait_for_everyone()
 
+    recorded_best_loss = best_loss if best_loss is not None else (loss if isinstance(loss, float) else loss.item())
     client_state = {
         "step": step,
-        "best_loss": loss if isinstance(loss, float) else loss.item(),
+        "best_loss": recorded_best_loss,
         "config": config.to_dict() if config else None,
     } if accelerator.is_main_process else {} 
 
@@ -297,7 +298,7 @@ def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=N
             unwrapped_model = accelerator.unwrap_model(model_engine)
             payload = {
                 "step": step,
-                "best_loss": loss if isinstance(loss, float) else loss.item(),
+                "best_loss": recorded_best_loss,
                 "config": config.to_dict() if config else None,
                 "norm_stats": norm_stats,
                 "model_state_dict": unwrapped_model.state_dict(),
@@ -587,6 +588,7 @@ def train(config: EvoConfig):
 
     if resume_pretrain:
         step = 0
+        best_loss = float("inf")
         logging.info("Resuming pretraining from scratch, resetting step to 0")
 
     scheduler = LambdaLR(optimizer, get_lr_lambda(warmup_steps, max_steps, resume_step=step))
@@ -768,7 +770,8 @@ def train(config: EvoConfig):
                     optimizer=optimizer,
                     scheduler=scheduler,
                     config=config,
-                    norm_stats=dataset.arm2stats_dict 
+                    norm_stats=dataset.arm2stats_dict,
+                    best_loss=best_loss,
                 )
                 accelerator.print("end to save best checkpoint")
                 if accelerator.is_main_process:
@@ -778,14 +781,14 @@ def train(config: EvoConfig):
 
             # === Save periodic checkpoint ===
             if step % ckpt_interval == 0 and step > 0:
-                save_checkpoint(save_dir, step=step, model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict)
+                save_checkpoint(save_dir, step=step, model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict, best_loss=best_loss)
                 prune_numeric_checkpoints(save_dir, config.keep_last_checkpoints, accelerator)
          
     # === Save final model unless the same step was just saved periodically ===
     if step > 0 and step % ckpt_interval == 0:
         logging.info("Final step %s is already saved to step_%s/; skipping duplicate step_final/", step, step)
     else:
-        save_checkpoint(save_dir, step="final", model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict)
+        save_checkpoint(save_dir, step="final", model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict, best_loss=best_loss)
         logging.info("Final model saved to step_final/")
     if not config.disable_best_checkpoint:
         logging.info(f"Best checkpoint saved to step_best/ with loss {best_loss:.6f}")
