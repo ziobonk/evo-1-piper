@@ -279,6 +279,7 @@ def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=N
     client_state = {
         "step": step,
         "best_loss": recorded_best_loss,
+        "best_loss_metric": "periodic_mean_v1",
         "config": config.to_dict() if config else None,
     } if accelerator.is_main_process else {} 
 
@@ -299,6 +300,7 @@ def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=N
             payload = {
                 "step": step,
                 "best_loss": recorded_best_loss,
+                "best_loss_metric": "periodic_mean_v1",
                 "config": config.to_dict() if config else None,
                 "norm_stats": norm_stats,
                 "model_state_dict": unwrapped_model.state_dict(),
@@ -326,6 +328,66 @@ def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=N
                 json.dump(norm_stats, f, indent=2)
                 
         logging.info(f"[Rank {accelerator.process_index}] Saved checkpoint to {checkpoint_dir}")
+
+
+def link_best_checkpoint(save_dir, source_step, mean_loss, accelerator):
+    """Publish step_best using hard links to a complete periodic checkpoint."""
+    accelerator.wait_for_everyone()
+    error = None
+    if accelerator.is_main_process:
+        source = os.path.join(save_dir, f"step_{source_step}")
+        best = os.path.join(save_dir, "step_best")
+        temp = os.path.join(save_dir, ".step_best_tmp")
+        previous = os.path.join(save_dir, ".step_best_previous")
+        try:
+            if not os.path.isfile(os.path.join(source, "checkpoint.json")):
+                raise RuntimeError(f"Cannot mark incomplete checkpoint as best: {source}")
+            if os.path.exists(temp):
+                shutil.rmtree(temp)
+            shutil.copytree(source, temp, copy_function=os.link)
+            with open(os.path.join(temp, "best_metric.json"), "w") as file:
+                json.dump({"step": source_step, "mean_loss": mean_loss, "metric": "periodic_mean_v1"}, file)
+            if os.path.exists(previous):
+                shutil.rmtree(previous)
+            if os.path.exists(best):
+                os.replace(best, previous)
+            try:
+                os.replace(temp, best)
+            except Exception:
+                if os.path.exists(previous):
+                    os.replace(previous, best)
+                raise
+            if os.path.exists(previous):
+                shutil.rmtree(previous)
+            logging.info("Updated step_best using hard links from %s", source)
+        except Exception as exc:
+            error = f"Could not update step_best from {source}: {exc}"
+        finally:
+            if os.path.exists(temp):
+                shutil.rmtree(temp)
+    if accelerator.distributed_type != DistributedType.NO:
+        errors = [error]
+        torch.distributed.broadcast_object_list(errors, src=0)
+        error = errors[0]
+    if error:
+        raise RuntimeError(error)
+
+
+def read_best_metric(save_dir):
+    """Use only a published best artifact as the baseline after resuming."""
+    best_dir = os.path.join(save_dir, "step_best")
+    metric_path = os.path.join(best_dir, "best_metric.json")
+    if not os.path.isfile(os.path.join(best_dir, "checkpoint.json")) or not os.path.isfile(metric_path):
+        return float("inf")
+    try:
+        with open(metric_path) as file:
+            metric = json.load(file)
+        value = float(metric["mean_loss"])
+        if metric.get("metric") == "periodic_mean_v1" and math.isfinite(value):
+            return value
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return float("inf")
 
 
 def prune_numeric_checkpoints(save_dir, keep_last, accelerator):
@@ -578,7 +640,12 @@ def train(config: EvoConfig):
                 load_optimizer_states=not resume_pretrain
             )
             
-        best_loss = client_state.get("best_loss", float("inf"))
+        if client_state.get("best_loss_metric") == "periodic_mean_v1":
+            best_loss = client_state.get("best_loss", float("inf"))
+        else:
+            best_loss = float("inf")
+            if accelerator.is_main_process:
+                logging.info("Legacy checkpoint has no periodic best metric; resetting best loss")
         if accelerator.is_main_process:
             logging.info(f"Resuming from {resume_dir}/{resume_tag}, step {step}")
     else:
@@ -590,6 +657,10 @@ def train(config: EvoConfig):
         step = 0
         best_loss = float("inf")
         logging.info("Resuming pretraining from scratch, resetting step to 0")
+    elif resume and not config.disable_best_checkpoint:
+        best_loss = read_best_metric(save_dir)
+        if accelerator.is_main_process:
+            logging.info("Published best periodic mean loss on resume: %s", best_loss)
 
     scheduler = LambdaLR(optimizer, get_lr_lambda(warmup_steps, max_steps, resume_step=step))
 
@@ -607,6 +678,8 @@ def train(config: EvoConfig):
         logging.info("Vision masking is enabled: all image masks will be set to 0 during training.")
 
     non_finite_streak = 0
+    loss_window_sum = 0.0
+    loss_window_count = 0
     last_log_time = time.perf_counter()
     last_log_step = step
     global_peak_allocated_gb = None
@@ -746,43 +819,35 @@ def train(config: EvoConfig):
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
    
-            # === Save best checkpoint ===
+            # === Accumulate a stable metric for periodic best selection ===
             loss_value = loss.item()
             if accelerator.is_main_process:
-                is_best = loss_value < best_loss
-                if is_best:
-                    best_loss = loss_value
-                is_best_tensor = torch.tensor(int(is_best), device=accelerator.device)
-            else:
-                is_best_tensor = torch.tensor(0, device=accelerator.device)
-            
-            if accelerator.distributed_type != DistributedType.NO:
-                torch.distributed.broadcast(is_best_tensor, src=0)
-            
-            if not config.disable_best_checkpoint and is_best_tensor.item() == 1 and step > 1000:
-                accelerator.print("start to save best checkpoint")
-                save_checkpoint(
-                    save_dir,
-                    step="best",
-                    model_engine=model_engine,
-                    loss=loss,
-                    accelerator=accelerator,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    config=config,
-                    norm_stats=dataset.arm2stats_dict,
-                    best_loss=best_loss,
-                )
-                accelerator.print("end to save best checkpoint")
-                if accelerator.is_main_process:
-                    logging.info(f"Saved best checkpoint at step {step} with loss {loss_value:.6f}")
+                loss_window_sum += loss_value
+                loss_window_count += 1
 
             step += 1
 
             # === Save periodic checkpoint ===
             if step % ckpt_interval == 0 and step > 0:
+                if accelerator.is_main_process:
+                    window_mean = loss_window_sum / max(1, loss_window_count)
+                    is_best = not config.disable_best_checkpoint and window_mean < best_loss
+                    if is_best:
+                        best_loss = window_mean
+                    logging.info("Mean training loss over last %s steps: %.6f", loss_window_count, window_mean)
+                else:
+                    is_best = False
+                is_best_tensor = torch.tensor(int(is_best), device=accelerator.device)
+                if accelerator.distributed_type != DistributedType.NO:
+                    torch.distributed.broadcast(is_best_tensor, src=0)
                 save_checkpoint(save_dir, step=step, model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict, best_loss=best_loss)
+                if is_best_tensor.item():
+                    link_best_checkpoint(save_dir, step, best_loss, accelerator)
+                    if accelerator.is_main_process:
+                        logging.info("Saved best checkpoint at step %s with periodic mean loss %.6f", step, best_loss)
                 prune_numeric_checkpoints(save_dir, config.keep_last_checkpoints, accelerator)
+                loss_window_sum = 0.0
+                loss_window_count = 0
          
     # === Save final model unless the same step was just saved periodically ===
     if step > 0 and step % ckpt_interval == 0:
@@ -791,7 +856,9 @@ def train(config: EvoConfig):
         save_checkpoint(save_dir, step="final", model_engine=model_engine, loss=loss, accelerator=accelerator, optimizer=optimizer, scheduler=scheduler, config=config, norm_stats=dataset.arm2stats_dict, best_loss=best_loss)
         logging.info("Final model saved to step_final/")
     if not config.disable_best_checkpoint:
-        logging.info(f"Best checkpoint saved to step_best/ with loss {best_loss:.6f}")
+        published_best = read_best_metric(save_dir)
+        if math.isfinite(published_best):
+            logging.info("Best periodic checkpoint saved to step_best/ with mean loss %.6f", published_best)
 
 
 if __name__ == "__main__":
@@ -832,7 +899,7 @@ if __name__ == "__main__":
     # Logging & checkpointing
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--ckpt_interval", type=int, default=10)
-    parser.add_argument("--disable_best_checkpoint", action="store_true", help="Skip frequently rewritten training-loss step_best checkpoints")
+    parser.add_argument("--disable_best_checkpoint", action="store_true", help="Do not maintain the periodic mean-loss step_best checkpoint")
     parser.add_argument("--keep_last_checkpoints", type=int, default=0, help="Keep only this many complete numeric checkpoints after a successful save; 0 keeps all")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
 
@@ -867,6 +934,8 @@ if __name__ == "__main__":
     parser.add_argument("--disable_cudnn_benchmark", action="store_true", help="Disable cuDNN benchmark (default is enabled)")
 
     args = parser.parse_args()
+    if args.ckpt_interval < 1:
+        parser.error("--ckpt_interval must be positive")
     if args.keep_last_checkpoints < 0:
         parser.error("--keep_last_checkpoints must be zero or positive")
     config_dict = vars(args)

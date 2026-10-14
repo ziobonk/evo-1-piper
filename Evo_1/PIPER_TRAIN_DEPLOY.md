@@ -80,7 +80,7 @@ accelerate launch --num_processes 1 --num_machines 1 \
 
 `--resume_pretrain` 只用于**第一阶段转第二阶段**：它加载模型权重，不恢复优化器，并把步数重置为 0。第二阶段解冻整个 VLM，显存需求会明显高于第一阶段；如果 batch 8 OOM，可以将 `--batch_size` 改为 2，同时新建一份 DeepSpeed 配置，将 `train_micro_batch_size_per_gpu` 改为 2，并按显存情况启用 CPU optimizer offload。不能只改命令行 batch 而保留 `ds_config.json` 中固定的 8。较小 batch 会改变每步看到的样本数，需据此重新决定总步数。
 
-训练中断后，选择**同阶段**最后一个完整的数值目录（例如 `step_2000`），在原命令中添加 `--resume --resume_path /.../step_2000`；第二阶段续训时删除 `--resume_pretrain`，并保持 `--max_steps 3000` 作为累计目标步数。不要把第二阶段的续训 checkpoint 指向第一阶段，也不要用 `step_final` 做常规续训。`step_best` 仅按单个训练 batch 的 loss 选出，不是验证集最优；优先比较固定间隔的 checkpoint 在独立演示和机器人上的表现。当前训练脚本没有验证集评估，不能仅凭训练 loss 判定可部署。
+训练中断后，选择**同阶段**最后一个完整的数值目录（例如 `step_2000`），在原命令中添加 `--resume --resume_path /.../step_2000`；第二阶段续训时删除 `--resume_pretrain`，并保持 `--max_steps 3000` 作为累计目标步数。不要把第二阶段的续训 checkpoint 指向第一阶段，也不要用旧版 `step_final` 做常规续训。新版 `step_best` 每逢 `--ckpt_interval` 比较前一段训练的平均 loss，从已保存的数值 checkpoint 建立硬链接，因而最多每个周期更新一次，也不会额外复制大文件。它仍只是训练集指标，不是验证集最优；优先比较固定间隔的 checkpoint 在独立演示和机器人上的表现。当前训练脚本没有验证集评估，不能仅凭训练 loss 判定可部署。
 
 缓存里记录了 `action_horizon`。两阶段保持 `--horizon 50` 和同一个 `--cache_dir`；若要试 10 帧窗口，请换一个缓存目录以重新导出数据。已导出的 50 帧缓存可以继续使用。
 
@@ -96,7 +96,7 @@ du -sh "$CKPT"/step_* | sort -h
 ls -lh "$CKPT/step_10500"
 ```
 
-可续训的单卡 DeepSpeed 目录至少应有非空的 `mp_rank_00_model_states.pt`、`*_optim_states.pt`、`checkpoint.json`、`config.json` 和 `norm_stats.json`。BF16 训练的优化器文件名可能以 `bf16_zero_pp_rank_0_` 开头。`checkpoint.json` 在模型和优化器保存成功后才写入。若 `step_11000` 缺少它，可删除这个不完整目录；先保留 `step_10500`，再把更早且确认不需要的 checkpoint 移到其他磁盘或逐个删除，至少腾出**一个完整 checkpoint 的大小**，还要留出日志和缓存余量。`step_best` 是单 batch 训练 loss 最低的一次，内部步数为字符串 `best`，不适合直接作为普通续训源；如需比较推理效果，可单独保留它。
+可续训的单卡 DeepSpeed 目录至少应有非空的 `mp_rank_00_model_states.pt`、`*_optim_states.pt`、`checkpoint.json`、`config.json` 和 `norm_stats.json`。BF16 训练的优化器文件名可能以 `bf16_zero_pp_rank_0_` 开头。`checkpoint.json` 在模型和优化器保存成功后才写入。若 `step_11000` 缺少它，可删除这个不完整目录；先保留 `step_10500`，再把更早且确认不需要的 checkpoint 移到其他磁盘或逐个删除，至少腾出**一个完整 checkpoint 的大小**，还要留出日志和缓存余量。旧版 `step_best` 来自单 batch loss，内部步数为字符串 `best`，不适合直接作为普通续训源；如需比较推理效果，可单独保留它。新版 `step_best` 来自数值 checkpoint 的硬链接，源目录后来被清理时它仍可读取。
 
 ```bash
 test -s "$CKPT/step_10500/checkpoint.json" && \
@@ -109,9 +109,9 @@ if test -d "$CKPT/step_11000" && ! test -f "$CKPT/step_11000/checkpoint.json"; t
 fi
 ```
 
-然后沿用**原第二阶段命令**及原 `--max_steps` 总步数，只把第一阶段转第二阶段时的 `--resume_path` 改为完整的 `"$CKPT/step_10500"`，保留 `--resume`，并**删除 `--resume_pretrain`**；否则步数会被重置为 0。建议加 `--disable_best_checkpoint --keep_last_checkpoints 2`：前者停止频繁重写 `step_best`，后者在新数值 checkpoint 完整保存后，只保留最近两个完整数值目录，不会删 `step_best` 或当前未完成目录。若剩余步数不多，可适当增大 `--ckpt_interval`；新版脚本也会避免在最终步已保存周期 checkpoint 时重复写 `step_final`。下一次保存仍需足够空间。不要把 `--max_steps` 写成“剩余步数”，也不要删正在作为 `--resume_path` 的目录。
+然后沿用**原第二阶段命令**及原 `--max_steps` 总步数，只把第一阶段转第二阶段时的 `--resume_path` 改为完整的 `"$CKPT/step_10500"`，保留 `--resume`，并**删除 `--resume_pretrain`**；否则步数会被重置为 0。建议加 `--keep_last_checkpoints 2`：新数值 checkpoint 完整保存后，只保留最近两个数值目录；`step_best` 的硬链接会保留其模型和优化器内容。想保留 best 时**不要加** `--disable_best_checkpoint`；若完全不需要 best，才加该参数。`--ckpt_interval 500` 表示每 500 步最多更新一次 best；若剩余步数不多，可适当增大间隔。新版脚本也会避免在最终步已保存周期 checkpoint 时重复写 `step_final`。下一次保存仍需足够空间。不要把 `--max_steps` 写成“剩余步数”，也不要删正在作为 `--resume_path` 的目录。
 
-如果恢复后几乎每步都打印 `start to save best checkpoint`，当前进程仍启用了 `step_best` 保存。先中断它，确认一个完整的数值 checkpoint，再用上面的两个参数重启；只有修改本地文件而不重启 AutoDL 进程不会生效。旧 checkpoint 把最后一个 batch 的 loss 写入 `best_loss`，所以恢复初期容易反复刷新“best”；新版训练器已改为保存真实的累计最小值。`step_best` 仍只基于训练 batch，不能代替验证集选择模型。
+如果恢复后几乎每步都打印 `start to save best checkpoint`，说明仍在运行旧版训练器。先中断它，确认一个完整的数值 checkpoint，同步新版代码后重启；只有修改本地文件而不重启 AutoDL 进程不会生效。旧 checkpoint 把最后一个 batch 的 loss 写入 `best_loss`，所以恢复初期容易反复刷新“best”；新版会将不兼容的旧指标重置，并按周期平均 loss 重新选择。`step_best` 仍只基于训练数据，不能代替验证集选择模型。
 
 ## 3. 推理服务
 
