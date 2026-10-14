@@ -89,19 +89,24 @@ accelerate launch --num_processes 1 --num_machines 1 \
 选择实际生成的 checkpoint 目录，其中须有 `config.json`、`norm_stats.json` 与 DeepSpeed 的 `mp_rank_00_model_states.pt` 或普通训练的 `checkpoint.pt`。
 
 ```bash
-cd Evo_1
+cd ~/autodl-tmp/evo-1-piper/Evo_1
 python scripts/Evo1_server.py \
-  --ckpt_dir ./checkpoints/piper_stage1/step_final \
+  --ckpt_dir /root/autodl-fs/evo/checkpoints/piper_stage1/step_10000 \
   --port 9000 \
   --arm_key piper_eef_absolute \
   --dataset_key piper_sdk_raw_eef_next_pose
 ```
 
-如果 GPU 服务不在机器人电脑上，把客户端的 `--server` 设成 GPU 机器的实际 IP。先确认网络可达、两台机器使用同一套相机视角与 TCP/夹爪标定。
+如果第二阶段 checkpoint 的离线验证更好，可将 `--ckpt_dir` 换成其数值 step 目录。如果 GPU 服务不在机器人电脑上，把客户端的 `--server` 设成 GPU 机器的实际 IP。先确认网络可达、两台机器使用同一套相机视角与 TCP/夹爪标定。
 
 ## 4. Piper 客户端
 
-在控制 Piper 的电脑上安装 `piper_sdk`、`scipy`、`opencv-python`、`websockets`，并激活 `can0`。脚本默认只读取机械臂反馈并打印预测动作；明确加 `--execute` 才会使能与下发。相机参数是 OpenCV 设备号或 V4L 路径，顺序必须是训练数据的外部相机、腕部相机。
+在控制 Piper 的电脑上安装 `piper_sdk`、`scipy`、`opencv-python`、`websockets`、`pyrealsense2`（`python -m pip install pyrealsense2`），并激活 `can0`。脚本默认只读取机械臂反馈并打印预测动作；明确加 `--execute` 才会使能与下发。两台 D435i 以序列号指定，全局相机对应数据集 `image`，手腕相机对应 `wrist_image`。只使用彩色图像；采集分辨率取数据集 metadata 中的 1280×720 和 640×480，默认请求 30 FPS，模型输入统一缩放到 448×448。请先查看实际序列号和相机视角：
+
+```bash
+cd /home/rhr/litevla/Evo-1/Evo_1
+python scripts/Evo1_client_piper.py --list-cameras
+```
 
 ```bash
 cd /home/rhr/openpi/piper_sdk && python -m pip install -e .
@@ -109,10 +114,24 @@ cd /home/rhr/litevla/Evo-1/Evo_1
 python scripts/Evo1_client_piper.py \
   --dataset ./piper_data \
   --server ws://127.0.0.1:9000 \
-  --base-camera /dev/video10 --wrist-camera /dev/video4 \
-  --cycles 20 --steps-per-chunk 3
+  --base-serial YOUR_BASE_SERIAL --wrist-serial YOUR_WRIST_SERIAL \
+  --camera-fps 30 --cycles 20 --steps-per-chunk 3 --control-hz 100
 ```
 
-先核对打印的目标位姿与当前反馈、摄像头画面、夹爪开合方向和可达范围。确认后再使用相同命令加 `--execute`。客户端按数据集 `tcp_offset_m` 转换 TCP 与法兰；本数据的偏移是零。夹爪宽度依 `gripper_mapping.robot_open_width_mm=70` 映射到 Piper 原生 0..70000。它每次只执行动作块前 3 帧，按 20 Hz 下发，并在每帧前检查位移、旋转、位置范围及夹爪范围。
+先核对打印的目标位姿与当前反馈、摄像头视角、夹爪开合方向和可达范围。确认后再使用相同命令加 `--execute`。客户端按数据集 `tcp_offset_m` 转换 TCP 与法兰；本数据的偏移是零。夹爪宽度依 `gripper_mapping.robot_open_width_mm=70` 映射到 Piper 原生 0..70000。每个预测块只使用前 3 个关键帧，每个关键帧占数据集的 1/20 秒；100 Hz 控制时在两帧之间发 5 条插值命令。位置和夹爪线性插值，姿态使用球面插值。原始关键帧仍须通过相对反馈的位移、旋转和工作空间检查，插值不会放宽限制。推理期间机器人保持上一目标，下一块从新的实测反馈开始。
 
-当前客户端只支持 Piper 原生夹爪与 OpenCV 可打开的相机。若实机使用达妙夹爪或 RealSense 专用采集管线，须把相应驱动接入 `Evo1_client_piper.py`，保证反馈与命令都仍是数据集定义的 0..70 mm 语义。实机执行、相机标定与 GPU 训练结果在当前机器上均未验证。
+若仍使用 V4L/OpenCV 相机，可加 `--camera-backend opencv --base-camera /dev/video10 --wrist-camera /dev/video4`。若 D435i 不支持所请求的彩色流规格，先用 `realsense-viewer` 查看两台相机的可用 profile，再调整 `--camera-fps`；切换采集分辨率须注意与训练数据视野一致。当前客户端只支持 Piper 原生夹爪；若实机使用达妙夹爪，须接入对应驱动并保持数据集定义的 0..70 mm 宽度语义。实机执行与相机标定在当前机器上未验证。
+
+## 5. 使用数据集离线验证并可视化
+
+先在 GPU 机器上启动第 3 节的推理服务，再运行下列脚本。它读取数据集 Parquet 中的两路 JPEG、7 维状态和任务文本，发送与实机客户端相同格式的请求；真值采用训练时的“下一帧绝对 TCP 位姿”定义。`--horizon` 须与 checkpoint 一致，当前训练为 50。它不需要连接 Piper 或 D435i。
+
+```bash
+cd ~/autodl-tmp/evo-1-piper/Evo_1
+python scripts/eval_piper_offline.py \
+  --dataset ./piper_data --server ws://127.0.0.1:9000 \
+  --episodes 0,10,20,30,40 --samples-per-episode 3 \
+  --horizon 50 --output ./piper_offline_eval
+```
+
+输出目录包含 `summary.json`（首 1 步、首 3 步和全 50 步的平均位置误差 mm、姿态误差度、夹爪误差 mm）、`errors.csv`（逐预测步误差）和每个样本的 PNG 对比图。图中同时显示两路输入图像、真实与预测 TCP 位置、夹爪宽度、位置及姿态误差。长动作块的后几步是**开环预测**，通常比第 1～3 步更难；本客户端只执行前 3 步。现有 41 条数据均参与训练，直接回放它们只是训练集诊断，不能代表未见场景或实机成功率。需要可信的泛化评估时，应先按 episode 留出数据并重新训练。

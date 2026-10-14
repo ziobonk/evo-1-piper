@@ -1,24 +1,112 @@
-"""Piper EEF client for a model trained with piper_eef_next_pose.
-
-Dry run is the default. Pass --execute only after checking the printed targets.
-Camera inputs are OpenCV device numbers or V4L paths in the same view order as
-the training data (base camera, then wrist camera).
-"""
+"""Piper EEF inference client. Dry run is the default; --execute sends commands."""
 
 import argparse
 import asyncio
 import json
+import math
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 import websockets
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
+
+
+ARM_KEY = "piper_eef_absolute"
+DATASET_KEY = "piper_sdk_raw_eef_next_pose"
 
 
 def camera_source(value):
     return int(value) if value.isdecimal() else value
+
+
+class OpenCVCamera:
+    def __init__(self, source, width, height, fps):
+        self.source = source
+        self.capture = cv2.VideoCapture(camera_source(source))
+        if not self.capture.isOpened():
+            raise RuntimeError(f"Could not open OpenCV camera {source}")
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.capture.set(cv2.CAP_PROP_FPS, fps)
+
+    def read(self):
+        ok, frame = self.capture.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Frame unavailable from OpenCV camera {self.source}")
+        return frame
+
+    def close(self):
+        self.capture.release()
+
+
+class RealSenseCamera:
+    def __init__(self, serial, width, height, fps):
+        import pyrealsense2 as rs
+
+        self.serial = serial
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_device(serial)
+        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        try:
+            self.pipeline.start(config)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Could not start D435i {serial} at {width}x{height}@{fps} BGR8; "
+                "check its supported color profile and USB connection"
+            ) from exc
+        self.closed = False
+
+    def read(self):
+        frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+        color = frames.get_color_frame()
+        if not color:
+            raise RuntimeError(f"Color frame unavailable from D435i {self.serial}")
+        return np.asanyarray(color.get_data()).copy()
+
+    def close(self):
+        if not self.closed:
+            self.pipeline.stop()
+            self.closed = True
+
+
+def list_realsense_cameras():
+    import pyrealsense2 as rs
+
+    devices = list(rs.context().query_devices())
+    if not devices:
+        print("No RealSense devices found")
+    for device in devices:
+        print(f"{device.get_info(rs.camera_info.name)}: {device.get_info(rs.camera_info.serial_number)}")
+
+
+def make_payload(base_frame, wrist_frame, state, prompt):
+    """The server expects BGR arrays and converts them to RGB before inference."""
+    images = [cv2.resize(frame, (448, 448), interpolation=cv2.INTER_CUBIC)
+              for frame in (base_frame, wrist_frame)]
+    images.append(np.zeros((448, 448, 3), dtype=np.uint8))
+    return {
+        "image": [image.tolist() for image in images],
+        "image_mask": [1, 1, 0],
+        "state": np.asarray(state, dtype=float).tolist(),
+        "action_mask": [1] * 7 + [0] * 17,
+        "prompt": prompt,
+        "arm_key": ARM_KEY,
+        "dataset_key": DATASET_KEY,
+    }
+
+
+def interpolate_target(start, end, fraction):
+    """Interpolate absolute TCP position, orientation and gripper width."""
+    if not 0 <= fraction <= 1:
+        raise ValueError("Interpolation fraction must be in [0, 1]")
+    result = np.empty(7, dtype=np.float64)
+    result[:3] = start[:3] + fraction * (end[:3] - start[:3])
+    result[3:6] = Slerp([0, 1], Rotation.from_rotvec([start[3:6], end[3:6]]))([fraction]).as_rotvec()[0]
+    result[6] = start[6] + fraction * (end[6] - start[6])
+    return result
 
 
 def read_state(piper, offset_m, open_width_mm):
@@ -77,19 +165,30 @@ async def run(args):
     if offset.shape != (3,) or not np.isfinite(offset).all() or open_width <= 0 or fps <= 0:
         raise ValueError("Invalid dataset TCP offset, gripper width or FPS")
 
-    base = cv2.VideoCapture(camera_source(args.base_camera))
-    wrist = cv2.VideoCapture(camera_source(args.wrist_camera))
-    if not base.isOpened() or not wrist.isOpened():
-        raise RuntimeError("Could not open both cameras")
-    for capture, key in ((base, "image"), (wrist, "wrist_image")):
-        height, width = info["features"][key]["shape"][:2]
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        capture.set(cv2.CAP_PROP_FPS, fps)
-    piper = C_PiperInterface_V2(can_name=args.can_name, judge_flag=False, can_auto_init=True, dh_is_offset=1)
-    piper.ConnectPort(piper_init=False)
+    if args.control_hz < fps:
+        raise ValueError(f"--control-hz must be at least the dataset rate ({fps:g} Hz)")
+    substeps = max(1, math.ceil(args.control_hz / fps))
+    command_hz = fps * substeps
+
+    base = wrist = piper = None
     enabled = False
     try:
+        cameras = (("image", args.base_serial if args.camera_backend == "realsense" else args.base_camera),
+                   ("wrist_image", args.wrist_serial if args.camera_backend == "realsense" else args.wrist_camera))
+        for key, source in cameras:
+            height, width = info["features"][key]["shape"][:2]
+            camera = (RealSenseCamera(source, width, height, args.camera_fps)
+                      if args.camera_backend == "realsense"
+                      else OpenCVCamera(source, width, height, args.camera_fps))
+            if key == "image":
+                base = camera
+            else:
+                wrist = camera
+        for _ in range(args.camera_warmup_frames):
+            await asyncio.gather(asyncio.to_thread(base.read), asyncio.to_thread(wrist.read))
+
+        piper = C_PiperInterface_V2(can_name=args.can_name, judge_flag=False, can_auto_init=True, dh_is_offset=1)
+        piper.ConnectPort(piper_init=False)
         if args.execute:
             deadline = time.monotonic() + 10
             while not piper.EnablePiper():
@@ -100,43 +199,43 @@ async def run(args):
             piper.MotionCtrl_2(0x01, 0x00, args.speed_pct, 0x00)
         async with websockets.connect(args.server, max_size=100_000_000) as ws:
             for cycle in range(args.cycles):
-                ok_base, base_frame = base.read()
-                ok_wrist, wrist_frame = wrist.read()
-                if not ok_base or not ok_wrist:
-                    raise RuntimeError("Camera frame unavailable")
+                base_frame, wrist_frame = await asyncio.gather(
+                    asyncio.to_thread(base.read), asyncio.to_thread(wrist.read))
                 current = read_state(piper, offset, open_width)
-                images = [cv2.resize(frame, (448, 448), interpolation=cv2.INTER_CUBIC)
-                          for frame in (base_frame, wrist_frame)]
-                images.append(np.zeros((448, 448, 3), dtype=np.uint8))
-                payload = {
-                    "image": [image.tolist() for image in images],
-                    "image_mask": [1, 1, 0],
-                    "state": current.astype(float).tolist(),
-                    "action_mask": [1] * 7 + [0] * 17,
-                    "prompt": prompt,
-                    "arm_key": "piper_eef_absolute",
-                    "dataset_key": "piper_sdk_raw_eef_next_pose",
-                }
-                await ws.send(json.dumps(payload))
+                await ws.send(json.dumps(make_payload(base_frame, wrist_frame, current, prompt)))
                 chunk = np.asarray(json.loads(await ws.recv()), dtype=np.float64)
-                if chunk.ndim != 2 or chunk.shape[1] < 7:
+                if chunk.ndim != 2 or chunk.shape[1] < 7 or len(chunk) < args.steps_per_chunk:
                     raise RuntimeError(f"Invalid model action shape: {chunk.shape}")
-                for target in chunk[:args.steps_per_chunk, :7]:
-                    validate_target(current, target, low, high, open_width,
+                next_tick = time.monotonic()
+                for keyframe in chunk[:args.steps_per_chunk, :7]:
+                    # Check the original target before interpolation so a large
+                    # model jump cannot be hidden by small intermediate steps.
+                    validate_target(current, keyframe, low, high, open_width,
                                     args.max_step_m, args.max_step_rad)
-                    print(f"cycle={cycle} target={np.array2string(target, precision=4)} execute={args.execute}")
+                    print(f"cycle={cycle} target={np.array2string(keyframe, precision=4)} execute={args.execute}")
+                    start = current.copy()
+                    previous = start
+                    for substep in range(1, substeps + 1):
+                        target = interpolate_target(start, keyframe, substep / substeps)
+                        validate_target(previous, target, low, high, open_width,
+                                        args.max_step_m, args.max_step_rad)
+                        if args.execute:
+                            await asyncio.sleep(max(0, next_tick - time.monotonic()))
+                            send_target(piper, target, offset, open_width)
+                        next_tick += 1 / command_hz
+                        previous = target
                     if args.execute:
-                        send_target(piper, target, offset, open_width)
-                        await asyncio.sleep(1 / fps)
-                        current = read_state(piper, offset, open_width)
-                    else:
-                        current = target
+                        await asyncio.sleep(max(0, next_tick - time.monotonic()))
+                    current = read_state(piper, offset, open_width) if args.execute else keyframe.copy()
     finally:
-        if enabled:
-            piper.DisableArm()
-        piper.DisconnectPort()
-        base.release()
-        wrist.release()
+        if piper is not None:
+            if enabled:
+                piper.DisableArm()
+            piper.DisconnectPort()
+        if base is not None:
+            base.close()
+        if wrist is not None:
+            wrist.close()
 
 
 if __name__ == "__main__":
@@ -144,15 +243,34 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=Path, default=Path("piper_data"))
     parser.add_argument("--server", default="ws://localhost:9000")
     parser.add_argument("--can-name", default="can0")
-    parser.add_argument("--base-camera", required=True)
-    parser.add_argument("--wrist-camera", required=True)
+    parser.add_argument("--camera-backend", choices=("realsense", "opencv"), default="realsense")
+    parser.add_argument("--list-cameras", action="store_true", help="List RealSense names and serial numbers")
+    parser.add_argument("--base-serial", help="Global D435i serial number")
+    parser.add_argument("--wrist-serial", help="Wrist D435i serial number")
+    parser.add_argument("--base-camera", help="OpenCV device number or V4L path")
+    parser.add_argument("--wrist-camera", help="OpenCV device number or V4L path")
+    parser.add_argument("--camera-fps", type=int, default=30)
+    parser.add_argument("--camera-warmup-frames", type=int, default=10)
     parser.add_argument("--cycles", type=int, default=20)
     parser.add_argument("--steps-per-chunk", type=int, default=3)
+    parser.add_argument("--control-hz", type=float, default=100.0,
+                        help="Command rate, rounded up to a multiple of dataset FPS")
     parser.add_argument("--max-step-m", type=float, default=0.02)
     parser.add_argument("--max-step-rad", type=float, default=0.15)
     parser.add_argument("--speed-pct", type=int, default=20)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
-    if args.cycles < 1 or args.steps_per_chunk < 1 or not 20 <= args.speed_pct <= 100:
-        parser.error("cycles and steps-per-chunk must be positive; speed-pct must be 20..100")
-    asyncio.run(run(args))
+    if args.list_cameras:
+        list_realsense_cameras()
+    else:
+        if args.camera_backend == "realsense":
+            if not args.base_serial or not args.wrist_serial or args.base_serial == args.wrist_serial:
+                parser.error("Provide different --base-serial and --wrist-serial (see --list-cameras)")
+        elif not args.base_camera or not args.wrist_camera:
+            parser.error("OpenCV backend requires --base-camera and --wrist-camera")
+        if (args.cycles < 1 or args.steps_per_chunk < 1 or args.camera_fps < 1
+                or args.camera_warmup_frames < 0 or args.control_hz <= 0
+                or args.max_step_m <= 0 or args.max_step_rad <= 0
+                or not 20 <= args.speed_pct <= 100):
+            parser.error("Invalid cycle, camera, control, safety or speed setting")
+        asyncio.run(run(args))
