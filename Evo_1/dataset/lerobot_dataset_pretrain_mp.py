@@ -477,6 +477,13 @@ class LeRobotDataset(Dataset):
             raise RuntimeError(
                 f"Unsupported cache schema {self._manifest.get('schema_version')} for {manifest_path}"
             )
+        cached_horizon = self._manifest.get("action_horizon")
+        if cached_horizon != self.action_horizon:
+            raise RuntimeError(
+                f"Cache action_horizon={cached_horizon} does not match requested "
+                f"--horizon {self.action_horizon}: {manifest_path}. "
+                "Use a different --cache_dir when changing the horizon."
+            )
 
         with open(index_path, "rb") as f:
             self._index = pickle.load(f)
