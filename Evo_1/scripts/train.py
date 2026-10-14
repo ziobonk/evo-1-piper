@@ -108,11 +108,9 @@ def setup_logging(log_dir: str) -> str:
     return log_path
 
 def init_wandb(config: EvoConfig, accelerator: Accelerator):
-
+    if config.disable_wandb:
+        return
     if accelerator.is_main_process:
-        if config.disable_wandb:
-            os.environ["WANDB_MODE"] = "disabled"
-
         wandb.init(
             project=config.wandb_project,
             name=config.run_name,
@@ -221,7 +219,7 @@ def dump_numerical_issue(save_dir: str, step: int, **named_tensors) -> str:
         json.dump(payload, handle, indent=2)
     return out_path
 
-def log_training_step(step, loss, total_norm, momentum_norm, scheduler, dataloader, accelerator, sec_per_step=None, samples_per_sec=None, it_per_sec=None, window_max_allocated_gb=None, window_max_reserved_gb=None, global_max_allocated_gb=None, global_max_reserved_gb=None):
+def log_training_step(step, loss, total_norm, momentum_norm, scheduler, dataloader, accelerator, sec_per_step=None, samples_per_sec=None, it_per_sec=None, window_max_allocated_gb=None, window_max_reserved_gb=None, global_max_allocated_gb=None, global_max_reserved_gb=None, disable_wandb=False):
     current_epoch = step / len(dataloader)
     
     # === Collect GPU memory stats ===
@@ -262,8 +260,9 @@ def log_training_step(step, loss, total_norm, momentum_norm, scheduler, dataload
             wandb_log_dict["global_max_allocated_gb"] = global_max_allocated_gb
             wandb_log_dict["global_max_reserved_gb"] = global_max_reserved_gb
 
-        wandb.log(wandb_log_dict)
-        swanlab.log(wandb_log_dict)
+        if not disable_wandb:
+            wandb.log(wandb_log_dict)
+            swanlab.log(wandb_log_dict)
 
 def save_checkpoint(save_dir, step, model_engine, loss, accelerator, optimizer=None, scheduler=None, config: EvoConfig=None, norm_stats=None):
     tag = f"step_{step}"
@@ -713,7 +712,8 @@ def train(config: EvoConfig):
                     window_max_allocated_gb=window_max_allocated_gb,
                     window_max_reserved_gb=window_max_reserved_gb,
                     global_max_allocated_gb=global_peak_allocated_gb,
-                    global_max_reserved_gb=global_peak_reserved_gb
+                    global_max_reserved_gb=global_peak_reserved_gb,
+                    disable_wandb=config.disable_wandb,
                 )
                 
                 last_log_time = now
