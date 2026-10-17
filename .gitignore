@@ -16,3 +16,5 @@ dist/
 *.pdf
 Evo_1/piper_data/
 Evo_1/piper_cache/
+.venv
+local/
