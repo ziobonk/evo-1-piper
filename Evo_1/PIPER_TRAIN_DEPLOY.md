@@ -49,7 +49,7 @@ accelerate launch --num_processes 1 --num_machines 1 \
   --dataset_config_path dataset/piper_eef_config.yaml \
   --cache_dir ./piper_cache \
   --save_dir /root/autodl-fs/evo/checkpoints/piper_stage1 \
-  --run_name piper_stage1 --disable_wandb \
+  --run_name piper_stage1 \
   --vlm_name OpenGVLab/InternVL3-1B \
   --action_head flowmatching --finetune_action_head \
   --per_action_dim 24 --state_dim 24 --horizon 50 \
@@ -117,6 +117,8 @@ fi
 
 选择实际生成的 checkpoint 目录，其中须有 `config.json`、`norm_stats.json` 与 DeepSpeed 的 `mp_rank_00_model_states.pt` 或普通训练的 `checkpoint.pt`。
 
+推理服务从 InternVL3 配置创建模型结构，再严格加载 EVO checkpoint 中的完整权重（含 VLM），不再先下载原始 InternVL3 权重。首次运行仍需要下载或预先缓存 `OpenGVLab/InternVL3-1B` 的配置、tokenizer 和自定义 Python 模型代码；已有这些缓存时可以加 `HF_HUB_OFFLINE=1` 启动。若旧版服务报 `pytorch_model.bin` 不存在并提示 `from_tf=True`，请更新代码后重试，不要改成加载 TensorFlow 权重。官方 InternVL3-1B 使用 `model.safetensors`，镜像访问异常可能触发这个误导提示。
+
 ```bash
 cd ~/autodl-tmp/evo-1-piper/Evo_1
 python scripts/Evo1_server.py \
@@ -127,6 +129,10 @@ python scripts/Evo1_server.py \
 ```
 
 如果第二阶段 checkpoint 的离线验证更好，可将 `--ckpt_dir` 换成其数值 step 目录。如果 GPU 服务不在机器人电脑上，把客户端的 `--server` 设成 GPU 机器的实际 IP。先确认网络可达、两台机器使用同一套相机视角与 TCP/夹爪标定。
+
+服务器会单独记录模型推理用时，默认保存到 `logs/evo1_server_inference_<时间戳>.jsonl`；服务器命令可追加 `--log-path logs/server_inference.jsonl` 指定追加写入的文件。每个请求记录 `model_inference_ms`、`chunk_length`、状态、错误、`request_id` 和启动时的 `run_id`，每条即时 flush。`model_inference_ms` 只测量 `model.run_inference()` 调用：开始前同步 CUDA 排除之前尚未完成的工作，结束后同步 CUDA 等待模型计算完成，再读高精度计时器。它包含模型调用内部的图像处理、tokenization 和 CPU 调度，不等同于 GPU kernel 时间之和；不包含网络传输、JSON 编解码、调用外的图像预处理与上传、状态归一化、动作反归一化和输出下载。第一条请求可能包含模型首次运行的初始化开销。旧客户端仍接收原有动作数组；新版 Piper 客户端通过 `return_timing=true` 请求带 `actions`、`timings` 和匹配 `request_id` 的响应。需要两端分阶段计时时，请重启服务器和客户端；新版客户端也兼容旧服务器返回的数组，但服务器阶段统计为 null。
+
+服务器正常退出、报错或 Ctrl+C 退出时，会在 `session_end` 中写入并打印本次启动的平均模型推理用时 `mean_model_inference_ms`、计入均值的请求数 `inference_count`、总推理用时 `total_model_inference_ms`，以及总请求数、失败数和中断数。均值只统计成功请求，包含首次推理，不统计失败或中断的请求，也不混入同一文件中以前启动的记录；没有成功推理时均值为 null。客户端断开连接不会结束服务器的统计，本次启动期间的多个连接共用统计。
 
 ## 4. Piper 客户端
 
@@ -142,12 +148,56 @@ cd /home/rhr/openpi/piper_sdk && python -m pip install -e .
 cd /home/rhr/litevla/Evo-1/Evo_1
 python scripts/Evo1_client_piper.py \
   --dataset ./piper_data \
-  --server ws://127.0.0.1:9000 \
-  --base-serial YOUR_BASE_SERIAL --wrist-serial YOUR_WRIST_SERIAL \
+  --server ws://localhost:6006 \
+  --base-serial 112222070761 --wrist-serial 231122071797 \
   --camera-fps 30 --cycles 20 --steps-per-chunk 3 --control-hz 100
 ```
 
 先核对打印的目标位姿与当前反馈、摄像头视角、夹爪开合方向和可达范围。确认后再使用相同命令加 `--execute`。客户端按数据集 `tcp_offset_m` 转换 TCP 与法兰；本数据的偏移是零。夹爪宽度依 `gripper_mapping.robot_open_width_mm=70` 映射到 Piper 原生 0..70000。每个预测块只使用前 3 个关键帧，每个关键帧占数据集的 1/20 秒；100 Hz 控制时在两帧之间发 5 条插值命令。位置和夹爪线性插值，姿态使用球面插值。原始关键帧仍须通过相对反馈的位移、旋转和工作空间检查，插值不会放宽限制。推理期间机器人保持上一目标，下一块从新的实测反馈开始。
+
+Piper 客户端现在默认使用 `--image-transport binary`：只发送两路缩放后的 `448×448` BGR uint8 原始图像及小型 JSON 元数据头，图像无损，不转像素列表、不做 JPEG 编码。服务器根据 `[1,1,0]` mask 补第三路零图，保持原有三路模型输入，并批量上传 uint8 图像到 GPU，再转换为 RGB 浮点张量；已是 `448×448` 时跳过重复缩放。两端 WebSocket 默认关闭压缩，适合本地推理。请重启 server 和 client 后使用；连接旧版服务器时可加 `--image-transport json` 回退。新版服务器继续接受旧 JSON 客户端，离线评估脚本的旧格式仍可用。
+
+推理 prompt 默认读取 `piper_data/meta/tasks.jsonl` 的第一条 `task`。可在客户端命令后追加 `--prompt "<control mode> end effector <control mode> pick up the cube and drop it into the box"` 覆盖，本次运行每轮都会发送该文本；启动时打印 `Task prompt`，并在 JSONL 的 `session_start.prompt` 中记录。这里的控制模式前缀与当前训练文本一致；无需修改数据集或重启服务器，只需重启客户端。当前数据集是单任务数据，替换任务文本不代表模型已经学会对应新任务。
+
+`--cycles 20` 会在 `cycle=0` 至 `cycle=19` 完成后正常退出；希望持续推理时改为 `--cycles 0`，用 Ctrl+C 停止。正常结束、异常退出或 Ctrl+C 时，客户端只断开 CAN 通信并释放相机，不再调用 `DisableArm()`，也不会发送新的运动目标或夹爪命令；退出后不主动改变机械臂使能状态。
+
+客户端默认将推理日志逐行保存到 `logs/piper_inference_<时间戳>.jsonl`，启动时打印绝对路径。可加 `--log-path logs/piper_run.jsonl` 指定文件；已有文件会追加，每次启动通过 `run_id` 区分，时间戳采用 UTC+8。日志包含 `session_start`、每轮 `cycle` 和退出时的 `session_end`，每条写入后立即 flush；报错或 Ctrl+C 也会保留当前轮记录和已下发计数。每轮还保存请求时的 7 维反馈、返回动作块的前 7 维、裁剪记录、通过检查的目标、拒绝原因和状态，不保存图像。
+
+| 每轮字段 | 含义 |
+| --- | --- |
+| `inference_latency_ms` | 客户端开始发送请求至收到完整响应的耗时，包含上传、网络、服务端排队和处理、响应下载；不是纯 GPU 计算时间。未收到完整响应时为 null |
+| `request_preparation_ms` | 图像缩放、请求构造和编码耗时，不包含在上述延迟中；binary 模式只序列化小型元数据头，并打包原始图像字节 |
+| `chunk_length` | 模型实际返回的动作块长度，如 50 |
+| `requested_steps` | 每块计划执行的关键帧数，即 `--steps-per-chunk` |
+| `processed_steps` | 完成检查和插值的关键帧数，试运行也计入 |
+| `executed_steps` | 所有插值控制点均成功下发的关键帧数；试运行为 0 |
+| `sent_control_steps` | 成功完成一次 `EndPoseCtrl` 和 `GripperCtrl` 调用的插值控制点数；试运行为 0 |
+| `execution_latency_ms` / `cycle_latency_ms` | 本轮处理或执行动作阶段 / 整轮耗时 |
+
+例如返回 50 步、选前 3 步、20 Hz 数据配合 100 Hz 控制时，一轮正常执行日志为 `chunk_length=50`、`executed_steps=3`、`sent_control_steps=15`。执行计数表示 SDK 命令调用成功，不表示机械臂已经到达目标；中途拒绝或中断时只累计此前完成的部分。退出记录汇总总轮数、已下发关键帧数及插值控制点数。
+
+客户端和服务器现在还各自保存一份独立延迟统计 JSON，默认文件名为各自 JSONL 的同名 `.latency.json`。可在客户端原命令末尾追加 `--latency-json logs/piper_latency.json`；这一份 JSON 会同时包含客户端和服务器分阶段统计。服务器可另加 `--latency-json logs/server_latency.json` 指定其统计文件，请勿让两个进程写同一个文件。每轮完成后更新，退出时再次保存；文件是完整 JSON，采用临时文件替换，便于 IDE 直接查看。每项统计包含 `count`、`mean_ms`、`min_ms`、`max_ms`、`total_ms`，未测量的项计数为 0、均值为 null；包含首次请求，只汇总当前启动的数据。
+
+| 延迟统计字段 | 范围 |
+| --- | --- |
+| `capture_ms` / `feedback_read_ms` | 客户端采集两路图像 / 读取机械臂反馈 |
+| `payload_build_ms` / `request_encode_ms` | 客户端缩放图像、构造请求 / 编码请求；binary 模式无像素列表，只打包元数据头及原始字节 |
+| `response_decode_ms` | 客户端解析响应 JSON 和动作数组 |
+| `client_data_processing_ms` | 客户端请求构造、序列化、响应解析的合计 |
+| `server_json_decode_ms` | 服务器解析 JSON；binary 模式只解析小型元数据头 |
+| `server_unpack_ms` | binary 请求校验和创建图像 NumPy 视图的耗时；JSON 模式为 0 |
+| `server_preprocess_ms` | 服务器图像转换、上传 GPU、状态归一化与 mask 准备，含 CUDA 同步等待 |
+| `server_model_inference_ms` | 客户端收到的服务器模型推理计时；服务器自己的统计中名为 `model_inference_ms` |
+| `server_postprocess_ms` | 服务器动作反归一化、复制回 CPU 和转为列表 |
+| `server_processing_ms` | 服务器从开始解析请求到完成动作后处理的总时间，涵盖上述服务器阶段及调用间开销 |
+| `server_response_encode_ms` | 服务器响应 JSON 序列化，仅在服务器统计中记录 |
+| `communication_and_other_ms` | 客户端请求往返耗时减去同一次请求的 `server_processing_ms`；包含传输、WebSocket 压缩/解压、响应序列化、日志写入及调度等，不是纯网络延迟 |
+
+客户端延迟统计计入成功解码的动作响应，即使该动作随后被范围检查拒绝；没有收到动作响应的中断轮次不计入。服务器延迟统计仅计入成功推理请求。两边用请求 ID 匹配数据，无需两台机器时钟同步。模型推理计时和分阶段统计含 CUDA 同步，因此实际阶段边界清晰；各项总时间与其子项有重叠，不应把所有字段相加。
+
+每轮 JSONL 还记录 `image_transport` 和 `request_bytes`，启动记录包含压缩设置。可用 `python scripts/benchmark_inference_transport.py --dataset ./piper_data --iterations 5` 比较旧 JSON 路径与新 binary 路径，结果保存到 `logs/inference_transport_benchmark.json`。该基准使用数据集真实图像，验证 CPU 模型输入逐元素相同，仅测请求构造、编解码和 CPU 预处理，不测网络、压缩、GPU 上传或模型推理；实测收益以重启两端后的延迟统计为准。
+
+Flow matching 输出没有硬性限制，反归一化也不会裁剪，因此闭合附近可能出现负值。客户端在试运行和执行模式下都会将有限的夹爪预测宽度裁剪到 `[0, robot_open_width_mm]`（本数据为 0～70 mm），再插值和下发；例如 `-0.28 mm` 裁剪为 `0 mm`，并打印 `gripper clipped` 及裁剪前后的值。NaN/Inf 仍拒绝，位置、姿态和步长检查保持原有阈值。默认试运行遇到被拒绝的关键帧会打印 `rejected`、跳过该动作块剩余关键帧并继续采样，`--execute` 则立即报错停止。`Target step too large: 0.08 m` 表示位移超过默认 0.02 m 限制，不会因夹爪裁剪而通过。
 
 若仍使用 V4L/OpenCV 相机，可加 `--camera-backend opencv --base-camera /dev/video10 --wrist-camera /dev/video4`。若 D435i 不支持所请求的彩色流规格，先用 `realsense-viewer` 查看两台相机的可用 profile，再调整 `--camera-fps`；切换采集分辨率须注意与训练数据视野一致。当前客户端只支持 Piper 原生夹爪；若实机使用达妙夹爪，须接入对应驱动并保持数据集定义的 0..70 mm 宽度语义。实机执行与相机标定在当前机器上未验证。
 

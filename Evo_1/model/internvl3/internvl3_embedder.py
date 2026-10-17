@@ -6,7 +6,7 @@ import torch.nn as nn
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 from transformers import GenerationConfig
 from torchvision.transforms.functional import to_pil_image
 from typing import Union, List
@@ -66,6 +66,7 @@ class InternVL3Embedder(nn.Module):
         device="cuda",
         enable_gradient_checkpointing: bool = False,
         gradient_checkpointing_use_reentrant: bool = False,
+        load_pretrained: bool = True,
     ):
         super().__init__()
         self.device = device
@@ -78,14 +79,26 @@ class InternVL3Embedder(nn.Module):
         use_flash_attn = flash_attn_is_available()
         if not use_flash_attn:
             logger.warning("flash_attn is not installed. Falling back to standard attention.")
-        self.model = AutoModel.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            use_flash_attn=use_flash_attn,
-            low_cpu_mem_usage=True,
-            _fast_init=False,
-        ).to(self.device) 
+        if load_pretrained:
+            self.model = AutoModel.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                use_flash_attn=use_flash_attn,
+                low_cpu_mem_usage=True,
+                _fast_init=False,
+            )
+        else:
+            # Full EVO checkpoints contain the VLM weights. Only its architecture
+            # and tokenizer are needed before restoring the checkpoint strictly.
+            model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            self.model = AutoModel.from_config(
+                model_config,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                use_flash_attn=use_flash_attn,
+            )
+        self.model = self.model.to(self.device)
         
         if hasattr(self.model.language_model, 'model'):
             layers = self.model.language_model.model.layers

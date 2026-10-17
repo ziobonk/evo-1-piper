@@ -11,7 +11,7 @@ from config import EvoConfig
 import logging
 
 class EVO1(nn.Module):
-    def __init__(self, config: EvoConfig):
+    def __init__(self, config: EvoConfig, *, load_pretrained: bool = True):
         super().__init__() 
         self.config = config
         self._device = config.device
@@ -22,6 +22,7 @@ class EVO1(nn.Module):
             device=self._device,
             enable_gradient_checkpointing=config.enable_gradient_checkpointing,
             gradient_checkpointing_use_reentrant=config.gradient_checkpointing_use_reentrant,
+            load_pretrained=load_pretrained,
         )
 
         action_head_type = config.action_head.lower()

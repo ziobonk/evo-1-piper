@@ -5,13 +5,16 @@ import argparse
 import os
 import asyncio
 import logging
+import math
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import time
+import uuid
 import websockets
 import numpy as np
 import cv2
 import json
 import torch
-from PIL import Image
-from torchvision import transforms
 from fvcore.nn import FlopCountAnalysis
 
 
@@ -19,6 +22,71 @@ from fvcore.nn import FlopCountAnalysis
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.Evo1 import EVO1
 from dataset.lerobot_dataset_pretrain_mp import NormalizationType
+try:
+    from .inference_latency import LatencyStats, SERVER_FIELDS
+    from .inference_transport import decode_request
+except ImportError:
+    from inference_latency import LatencyStats, SERVER_FIELDS
+    from inference_transport import decode_request
+
+
+def write_server_log(log_file, record):
+    timestamp = datetime.now(timezone(timedelta(hours=8))).isoformat()
+    log_file.write(json.dumps({"timestamp": timestamp, **record}, ensure_ascii=False, allow_nan=False) + "\n")
+    log_file.flush()
+
+
+class InferenceTimingStats:
+    def __init__(self):
+        self.request_count = 0
+        self.inference_count = 0
+        self.failed_requests = 0
+        self.interrupted_requests = 0
+        self.total_model_inference_ms = 0.0
+
+    def observe(self, record):
+        self.request_count += 1
+        if record["status"] == "error":
+            self.failed_requests += 1
+        elif record["status"] == "interrupted":
+            self.interrupted_requests += 1
+        latency = record.get("model_inference_ms")
+        if record["status"] == "ok" and latency is not None and math.isfinite(latency) and latency >= 0:
+            self.inference_count += 1
+            self.total_model_inference_ms += latency
+
+    def summary(self):
+        return {
+            "request_count": self.request_count,
+            "inference_count": self.inference_count,
+            "failed_requests": self.failed_requests,
+            "interrupted_requests": self.interrupted_requests,
+            "total_model_inference_ms": self.total_model_inference_ms,
+            "mean_model_inference_ms": (
+                self.total_model_inference_ms / self.inference_count if self.inference_count else None
+            ),
+        }
+
+
+def save_server_summary(log_file, run_id, stats):
+    summary = stats.summary()
+    write_server_log(log_file, {"event": "session_end", "run_id": run_id, **summary})
+    mean = summary["mean_model_inference_ms"]
+    mean_text = f"{mean:.3f} ms" if mean is not None else "unavailable (no successful inference)"
+    print(f"Server inference summary: count={summary['inference_count']} "
+          f"mean_model_inference_ms={mean_text} failed={summary['failed_requests']} "
+          f"interrupted={summary['interrupted_requests']}")
+
+
+def timed_model_inference(model, metrics, *, device="cuda", **inputs):
+    """Measure the model call with completed CUDA work at both boundaries."""
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    try:
+        return model.run_inference(**inputs)
+    finally:
+        torch.cuda.synchronize(device)
+        metrics["model_inference_ms"] = (time.perf_counter() - started) * 1000
 
 
 
@@ -202,7 +270,7 @@ def load_model_and_normalizer(ckpt_dir):
 
     from config import EvoConfig
     config = EvoConfig.from_dict(config_dict)
-    model = EVO1(config).eval()
+    model = EVO1(config, load_pretrained=False).eval()
     ds_path = os.path.join(ckpt_dir, "mp_rank_00_model_states.pt")
     torch_path = os.path.join(ckpt_dir, "checkpoint.pt")
     if os.path.isfile(ds_path):
@@ -223,18 +291,31 @@ def load_model_and_normalizer(ckpt_dir):
 
 
 
-def decode_image_from_list(img_list):
-    img_array = np.array(img_list, dtype=np.uint8)
-    img = cv2.resize(img_array, (448, 448))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(img)
-    return transforms.ToTensor()(pil).to("cuda")
+def prepare_image_batch(images, device="cuda"):
+    """Convert three BGR inputs to RGB float tensors with one uint8 upload."""
+    if len(images) != 3:
+        raise ValueError("Must provide exactly 3 images")
+    rgb_images = []
+    for image in images:
+        image = np.asarray(image, dtype=np.uint8)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("Images must have shape (height, width, 3)")
+        if image.shape != (448, 448, 3):
+            image = cv2.resize(image, (448, 448))
+        rgb_images.append(image[..., ::-1])
+    # Stack creates writable contiguous storage, including for frombuffer views.
+    batch = np.stack(rgb_images)
+    tensor = torch.from_numpy(batch).to(device=device)
+    tensor = tensor.permute(0, 3, 1, 2).to(dtype=torch.float32).div_(255.0)
+    return list(tensor.unbind(0))
 
 
 
-def infer_from_json_dict(data: dict, model, normalizer, arm_key, dataset_key):
+def infer_from_json_dict(data: dict, model, normalizer, arm_key, dataset_key, *, metrics=None):
     device = "cuda"
-    model_dtype = next(model.parameters()).dtype
+    if metrics is None:
+        metrics = {}
+    preprocessing_started = time.perf_counter()
     # Prefer per-request arm_key/dataset_key from the client payload; fall back to the
     # server startup defaults. Needed for multi-task benchmarks (RoboTwin sends
     # arm_key=aloha_joint and a per-task dataset_key=robotwin_<task>, and the norm
@@ -243,10 +324,7 @@ def infer_from_json_dict(data: dict, model, normalizer, arm_key, dataset_key):
     dataset_key = data.get("dataset_key", dataset_key)
 
   
-    images = [decode_image_from_list(img) for img in data["image"]]
-    assert len(images) == 3, "Must provide exactly 3 images."
-    for img in images:
-        assert img.shape == (3, 448, 448), "image_size must be (3,448,448)"
+    images = prepare_image_batch(data["image"], device=device)
 
  
     state = torch.tensor(data["state"], dtype=torch.float32, device=device)
@@ -267,31 +345,79 @@ def infer_from_json_dict(data: dict, model, normalizer, arm_key, dataset_key):
     elif action_mask.ndim == 2 and action_mask.shape[0] != 1:
         action_mask = action_mask.unsqueeze(0)
 
-    print(f"image_mask,{image_mask}")
-    print(f"action_mask,{action_mask}")
+    torch.cuda.synchronize(device)
+    metrics["server_preprocess_ms"] = (time.perf_counter() - preprocessing_started) * 1000
     
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        action = model.run_inference(
+        action = timed_model_inference(
+            model, metrics, device=device,
             images=images,
             image_mask=image_mask,
             prompt=prompt,
             state_input=norm_state,
             action_mask=action_mask
         )
+        postprocessing_started = time.perf_counter()
         action = action.reshape(1, -1, 24)
         action = normalizer.denormalize_action(action[0], arm_key, dataset_key)
-        return action.cpu().numpy().tolist()
+        result = action.cpu().numpy().tolist()
+        metrics["server_postprocess_ms"] = (time.perf_counter() - postprocessing_started) * 1000
+        return result
 
 
-async def handle_request(websocket, model, normalizer, arm_key, dataset_key):
+async def handle_request(websocket, model, normalizer, arm_key, dataset_key, *, log_file=None, run_id=None,
+                         stats=None, latency_stats=None, latency_path=None):
     print("Client connected")
     try:
         async for message in websocket:
-           
-            json_data = json.loads(message)
-            print(f"Received JSON observation")
-            actions = infer_from_json_dict(json_data, model, normalizer, arm_key, dataset_key)
-            await websocket.send(json.dumps(actions))
+            record = {
+                "event": "inference", "run_id": run_id, "request_id": uuid.uuid4().hex,
+                "model_inference_ms": None, "chunk_length": None,
+                "status": "running", "error": None,
+            }
+            try:
+                processing_started = time.perf_counter()
+                json_data = decode_request(message, record)
+                record["request_bytes"] = len(message) if isinstance(message, bytes) else len(message.encode("utf-8"))
+                record["request_id"] = json_data.get("request_id", record["request_id"])
+                record["arm_key"] = json_data.get("arm_key", arm_key)
+                record["dataset_key"] = json_data.get("dataset_key", dataset_key)
+                actions = infer_from_json_dict(
+                    json_data, model, normalizer, arm_key, dataset_key, metrics=record,
+                )
+                record["chunk_length"] = len(actions)
+                record["status"] = "ok"
+                record["server_processing_ms"] = (time.perf_counter() - processing_started) * 1000
+                if json_data.get("return_timing", False):
+                    response = {
+                        "actions": actions, "request_id": record["request_id"], "server_run_id": run_id,
+                        "timings": {field: record[field] for field in SERVER_FIELDS if field in record},
+                    }
+                else:
+                    response = actions
+                encode_started = time.perf_counter()
+                encoded_response = json.dumps(response)
+                record["server_response_encode_ms"] = (time.perf_counter() - encode_started) * 1000
+            except BaseException as exc:
+                record["status"] = (
+                    "interrupted" if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else "error"
+                )
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                if stats is not None:
+                    stats.observe(record)
+                if latency_stats is not None and record["status"] == "ok":
+                    latency_stats.observe(record)
+                if log_file is not None:
+                    write_server_log(log_file, record)
+                if record["model_inference_ms"] is not None:
+                    print(f"request={record['request_id']} model_inference_ms={record['model_inference_ms']:.3f} "
+                          f"chunk_length={record['chunk_length']} status={record['status']}")
+            await websocket.send(encoded_response)
+            if latency_stats is not None and latency_path is not None:
+                latency_stats.save(latency_path, role="server", run_id=run_id,
+                                   scope="Successful inference requests; includes first request")
             print("Sent action chunk")
 
 
@@ -306,6 +432,10 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--arm_key", default="piper_eef_absolute")
     parser.add_argument("--dataset_key", default="piper_sdk_raw_eef_next_pose")
+    parser.add_argument("--log-path", type=Path,
+                        help="Server model timing JSONL; default: logs/evo1_server_inference_<timestamp>.jsonl")
+    parser.add_argument("--latency-json", type=Path,
+                        help="Separate latency summary JSON; default: <log basename>.latency.json")
     args = parser.parse_args()
     ckpt_dir = args.ckpt_dir
     port = args.port
@@ -314,13 +444,40 @@ if __name__ == "__main__":
 
     print("Loading EVO_1 model...")
     model, normalizer = load_model_and_normalizer(ckpt_dir)
+    run_id = uuid.uuid4().hex
+    inference_stats = InferenceTimingStats()
+    latency_stats = LatencyStats(SERVER_FIELDS)
+    log_path = args.log_path or Path("logs") / (
+        f"evo1_server_inference_{datetime.now(timezone(timedelta(hours=8))):%Y%m%d_%H%M%S_%f}.jsonl"
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    latency_path = args.latency_json or log_path.with_suffix(".latency.json")
 
     async def main():
         print(f"EVO_1 server running at ws://0.0.0.0:{port}")
         async with websockets.serve(
-            lambda ws: handle_request(ws, model, normalizer, arm_key, dataset_key),
-            "0.0.0.0", port, max_size=100_000_000, ping_interval=None, ping_timeout=None
+            lambda ws: handle_request(ws, model, normalizer, arm_key, dataset_key,
+                                      log_file=inference_log, run_id=run_id, stats=inference_stats,
+                                      latency_stats=latency_stats, latency_path=latency_path),
+            "0.0.0.0", port, max_size=100_000_000, ping_interval=None, ping_timeout=None,
+            compression=None,
         ):
             await asyncio.Future()
 
-    asyncio.run(main())
+    with log_path.open("a", encoding="utf-8") as inference_log:
+        print(f"Server inference log: {log_path.resolve()}")
+        print(f"Server latency JSON: {latency_path.resolve()}")
+        write_server_log(inference_log, {
+            "event": "session_start", "run_id": run_id,
+            "checkpoint": str(Path(ckpt_dir).resolve()), "port": port,
+            "timing_scope": "CUDA-synchronized model.run_inference only",
+            "websocket_compression": None,
+        })
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("Server stopped by user")
+        finally:
+            save_server_summary(inference_log, run_id, inference_stats)
+            latency_stats.save(latency_path, role="server", run_id=run_id,
+                               scope="Successful inference requests; includes first request")
